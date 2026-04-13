@@ -3,7 +3,7 @@
 import type { PredicateConfig } from '../shared/types.js';
 
 /** Sample sizes to iterate through. */
-export const SAMPLE_SIZES = [100000, 50000, 10000];
+export const SAMPLE_SIZES = [1000000, 500000, 100000];
 
 /** The predicate under test. */
 export const PREDICATE: PredicateConfig = {

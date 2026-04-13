@@ -72,5 +72,5 @@ export class Generator {
 // CLI entry point
 if (process.argv[1] && import.meta.url.endsWith(process.argv[1].replace(/\\\\/g, '/'))) {
   const gen = new Generator(12345);
-  gen.generateAndSave([100, 1000, 10000]);
+  gen.generateAndSave([1000000, 500000, 100000]);
 }
