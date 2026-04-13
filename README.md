@@ -147,6 +147,4 @@ System C uses Circom + snarkjs for Groth16 proofs:
 | Sample sizes | `100, 1000, 10000` | CLI: `--sample-sizes 100,1000` |
 | PRNG seed | `12345` | Hardcoded in config |
 
-## License
-
 Research prototype — KTH Royal Institute of Technology (II142X)
