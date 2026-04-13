@@ -1,0 +1,39 @@
+# Docker Compose — Node.js App + PostgreSQL for Benchmarking
+# Usage:
+#   docker-compose up --build          # Build and run benchmark
+#   docker-compose up -d postgres      # Start only PostgreSQL
+#   docker-compose run app npx tsx src/benchmark/test-runner.ts --sample-sizes 100
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: benchmark
+      POSTGRES_USER: bench
+      POSTGRES_PASSWORD: bench123
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U bench -d benchmark"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  app:
+    build: .
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgres://bench:bench123@postgres:5432/benchmark
+      ENABLE_ZKP: "true"
+      CSV_OUTPUT: results/results.csv
+    volumes:
+      - ./results:/app/results
+      - ./data:/app/data
+    command: npx tsx src/benchmark/test-runner.ts
+
+volumes:
+  pgdata:

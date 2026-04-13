@@ -1,0 +1,26 @@
+{
+  "name": "predicate-based-data-sharing",
+  "version": "1.0.0",
+  "description": "Research prototype comparing Traditional, Predicate-Based, and ZK verification architectures",
+  "type": "module",
+  "scripts": {
+    "build": "tsc",
+    "generate-data": "npx tsx src/data-generator/generator.ts",
+    "test-runner": "npx tsx src/benchmark/test-runner.ts",
+    "export-csv": "npx tsx src/shared/export-csv.ts",
+    "build-circuits": "bash circuits/build-circuits.sh"
+  },
+  "dependencies": {
+    "pg": "^8.13.1",
+    "seedrandom": "^3.0.5",
+    "snarkjs": "^0.7.5",
+    "circomlib": "^2.0.5"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "@types/pg": "^8.11.10",
+    "@types/seedrandom": "^3.0.8",
+    "tsx": "^4.19.0",
+    "typescript": "^5.7.0"
+  }
+}
