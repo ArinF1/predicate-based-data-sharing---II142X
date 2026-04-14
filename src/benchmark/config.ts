@@ -29,3 +29,9 @@ export const LOG_INTERVAL = 100;
 
 /** Number of throwaway warmup iterations to stabilize JIT before measurement. */
 export const WARMUP_ITERATIONS = 500;
+
+/** Maximum time (ms) to wait for a single ZK proof before skipping that user. */
+export const ZK_PROOF_TIMEOUT_MS = 120_000;
+
+/** Flush results to DB every N iterations (prevents memory buildup and data loss). */
+export const DB_FLUSH_SIZE = 5000;

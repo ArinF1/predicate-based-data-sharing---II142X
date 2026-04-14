@@ -28,6 +28,8 @@ import {
   WARMUP_ITERATIONS,
   ENABLE_ZKP,
   LOG_INTERVAL,
+  ZK_PROOF_TIMEOUT_MS,
+  DB_FLUSH_SIZE,
 } from './config.js';
 import type {
   BenchmarkResult,
@@ -37,7 +39,69 @@ import type {
   ZKSetupArtifacts,
 } from '../shared/types.js';
 
-// CLI argument parsing
+// ── Utilities ────────────────────────────────────────────────────────────────
+
+/** Running statistics — avoids holding all results in memory for summary. */
+interface RunningStats {
+  system: string;
+  count: number;
+  validCount: number;        // entries with latency > 0 (actual proofs)
+  totalLatencyNs: bigint;
+  totalCpuMs: number;
+  totalPayloadBytes: number;
+  provedCount: number;       // ZK proofs successfully generated
+  timedOutCount: number;     // ZK proofs that timed out
+  errorCount: number;        // ZK proofs that errored
+}
+
+function emptyStats(system: string): RunningStats {
+  return {
+    system,
+    count: 0,
+    validCount: 0,
+    totalLatencyNs: 0n,
+    totalCpuMs: 0,
+    totalPayloadBytes: 0,
+    provedCount: 0,
+    timedOutCount: 0,
+    errorCount: 0,
+  };
+}
+
+/**
+ * Timeout wrapper — rejects if the promise doesn't resolve within `ms` milliseconds.
+ * Prevents deadlocks from snarkjs WASM hangs.
+ */
+function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => {
+      reject(new Error(`TIMEOUT after ${ms}ms: ${label}`));
+    }, ms);
+    promise.then(
+      (val) => { clearTimeout(timer); resolve(val); },
+      (err) => { clearTimeout(timer); reject(err); }
+    );
+  });
+}
+
+/**
+ * Flush a buffer of results to the database and clear it.
+ * Returns the number of flushed results.
+ */
+async function flushBuffer(
+  buffer: BenchmarkResult[],
+  label: string
+): Promise<number> {
+  if (buffer.length === 0) return 0;
+  const count = buffer.length;
+  await logResults([...buffer]);
+  buffer.length = 0;
+  console.log(`    [${label}] Flushed ${count} results to DB`);
+  return count;
+}
+
+// ── CLI Argument Parsing ─────────────────────────────────────────────────────
+
 function parseArgs(): { sampleSizes: number[]; enableZkp: boolean } {
   const args = process.argv.slice(2);
   let sampleSizes = SAMPLE_SIZES;
@@ -56,11 +120,12 @@ function parseArgs(): { sampleSizes: number[]; enableZkp: boolean } {
   return { sampleSizes, enableZkp };
 }
 
-// System A benchmark
+// ── System A Benchmark ───────────────────────────────────────────────────────
+
 async function benchmarkSystemA(
   users: UserRecord[],
   sampleSize: number
-): Promise<BenchmarkResult[]> {
+): Promise<RunningStats> {
   console.log(`  [System A — Traditional] Processing ${users.length} users...`);
 
   const notary = new NotaryA();
@@ -69,7 +134,8 @@ async function benchmarkSystemA(
 
   notary.setup(users);
 
-  const results: BenchmarkResult[] = [];
+  const stats = emptyStats('A');
+  const buffer: BenchmarkResult[] = [];
 
   for (let i = 0; i < users.length; i++) {
     const user = users[i];
@@ -82,7 +148,7 @@ async function benchmarkSystemA(
 
     const payloadBytes = measurePayloadBytes(result.payload);
 
-    results.push({
+    buffer.push({
       system: 'A_RAW',
       sample_size: sampleSize,
       user_id: user.id,
@@ -94,19 +160,34 @@ async function benchmarkSystemA(
       timestamp: new Date(),
     });
 
+    stats.count++;
+    stats.validCount++;
+    stats.totalLatencyNs += latencyNs;
+    stats.totalCpuMs += cpuTimeMs;
+    stats.totalPayloadBytes += payloadBytes;
+
+    // Incremental DB flush
+    if (buffer.length >= DB_FLUSH_SIZE) {
+      await flushBuffer(buffer, 'A');
+    }
+
     if ((i + 1) % LOG_INTERVAL === 0) {
       console.log(`    [A] ${i + 1}/${users.length} — last: ${formatNs(latencyNs)}`);
     }
   }
 
-  return results;
+  // Flush remaining
+  await flushBuffer(buffer, 'A');
+
+  return stats;
 }
 
-// System B benchmark
+// ── System B Benchmark ───────────────────────────────────────────────────────
+
 async function benchmarkSystemB(
   users: UserRecord[],
   sampleSize: number
-): Promise<BenchmarkResult[]> {
+): Promise<RunningStats> {
   console.log(`  [System B — Predicate-Based] Processing ${users.length} users...`);
 
   const notary = new NotaryB();
@@ -119,7 +200,8 @@ async function benchmarkSystemB(
   const setupTime = process.hrtime.bigint() - setupStart;
   console.log(`    [B] Setup complete in ${formatNs(setupTime)}`);
 
-  const results: BenchmarkResult[] = [];
+  const stats = emptyStats('B');
+  const buffer: BenchmarkResult[] = [];
 
   for (let i = 0; i < users.length; i++) {
     const user = users[i];
@@ -139,7 +221,7 @@ async function benchmarkSystemB(
     };
     const payloadBytes = measurePayloadBytes(witnessPayload);
 
-    results.push({
+    buffer.push({
       system: 'B_PRED',
       sample_size: sampleSize,
       user_id: user.id,
@@ -151,20 +233,36 @@ async function benchmarkSystemB(
       timestamp: new Date(),
     });
 
+    stats.count++;
+    stats.validCount++;
+    stats.totalLatencyNs += latencyNs;
+    stats.totalCpuMs += cpuTimeMs;
+    stats.totalPayloadBytes += payloadBytes;
+
+    // Incremental DB flush
+    if (buffer.length >= DB_FLUSH_SIZE) {
+      await flushBuffer(buffer, 'B');
+    }
+
     if ((i + 1) % LOG_INTERVAL === 0) {
       console.log(`    [B] ${i + 1}/${users.length} — last: ${formatNs(latencyNs)}`);
     }
   }
 
-  return results;
+  // Flush remaining
+  await flushBuffer(buffer, 'B');
+
+  return stats;
 }
 
-// System C benchmark
+// ── System C Benchmark (with timeout protection) ─────────────────────────────
+
 async function benchmarkSystemC(
   users: UserRecord[],
   sampleSize: number
-): Promise<BenchmarkResult[]> {
+): Promise<RunningStats> {
   console.log(`  [System C — ZK] Processing ${users.length} users...`);
+  console.log(`    [C] Proof timeout: ${ZK_PROOF_TIMEOUT_MS / 1000}s per user`);
 
   const notary = new NotaryC();
   const seller = new SellerC();
@@ -178,10 +276,14 @@ async function benchmarkSystemC(
   } catch (err) {
     console.error(`    [C] ERROR: ${(err as Error).message}`);
     console.error('    [C] Skipping ZK benchmarks. Run build-circuits.sh first.');
-    return [];
+    return emptyStats('C');
   }
 
-  const results: BenchmarkResult[] = [];
+  const stats = emptyStats('C');
+  const buffer: BenchmarkResult[] = [];
+
+  // Log interval for System C is shorter since each iteration is much slower
+  const zkLogInterval = Math.max(1, Math.min(LOG_INTERVAL, 10));
 
   for (let i = 0; i < users.length; i++) {
     const user = users[i];
@@ -191,7 +293,7 @@ async function benchmarkSystemC(
       user.location === PREDICATE.targetLocation;
 
     if (!canProve) {
-      results.push({
+      buffer.push({
         system: 'C_ZKP',
         sample_size: sampleSize,
         user_id: user.id,
@@ -202,19 +304,44 @@ async function benchmarkSystemC(
         predicate_result: false,
         timestamp: new Date(),
       });
+      stats.count++;
+
+      // Incremental DB flush (even for skipped users)
+      if (buffer.length >= DB_FLUSH_SIZE) {
+        await flushBuffer(buffer, 'C');
+      }
+
+      // Periodic progress for skipped users (less frequent)
+      if ((i + 1) % LOG_INTERVAL === 0) {
+        console.log(`    [C] ${i + 1}/${users.length} — skipped (non-qualifying)`);
+      }
       continue;
     }
 
+    // ── ZK proof generation with timeout protection ──
     try {
+      const proofStartTime = Date.now();
+      console.log(`    [C] ${i + 1}/${users.length} — generating proof for user ${user.id} (age=${user.age}, loc=${user.location})...`);
+
       const { result, latencyNs, cpuTimeMs } = await measureExecution(async () => {
-        const zkProof = await seller.generateProof(user, artifacts, PREDICATE);
-        const verification = await buyer.verify(zkProof, artifacts.vkeyJson);
+        // Wrap fullProve with timeout to prevent deadlock
+        const zkProof = await withTimeout(
+          seller.generateProof(user, artifacts, PREDICATE),
+          ZK_PROOF_TIMEOUT_MS,
+          `fullProve for user ${user.id}`
+        );
+        // Wrap verify with timeout as well
+        const verification = await withTimeout(
+          buyer.verify(zkProof, artifacts.vkeyJson),
+          ZK_PROOF_TIMEOUT_MS,
+          `verify for user ${user.id}`
+        );
         return { zkProof, verification };
       });
 
       const payloadBytes = measurePayloadBytes(result.zkProof);
 
-      results.push({
+      buffer.push({
         system: 'C_ZKP',
         sample_size: sampleSize,
         user_id: user.id,
@@ -225,8 +352,30 @@ async function benchmarkSystemC(
         predicate_result: result.verification.result,
         timestamp: new Date(),
       });
+
+      stats.count++;
+      stats.validCount++;
+      stats.totalLatencyNs += latencyNs;
+      stats.totalCpuMs += cpuTimeMs;
+      stats.totalPayloadBytes += payloadBytes;
+      stats.provedCount++;
+
+      const elapsed = Date.now() - proofStartTime;
+      console.log(`    [C] ${i + 1}/${users.length} — proved in ${elapsed}ms (total proofs: ${stats.provedCount}, timeouts: ${stats.timedOutCount})`);
+
     } catch (err) {
-      results.push({
+      const errMsg = (err as Error).message;
+      const isTimeout = errMsg.startsWith('TIMEOUT');
+
+      if (isTimeout) {
+        stats.timedOutCount++;
+        console.warn(`    [C] ⚠ ${i + 1}/${users.length} — TIMEOUT for user ${user.id} after ${ZK_PROOF_TIMEOUT_MS / 1000}s (total timeouts: ${stats.timedOutCount})`);
+      } else {
+        stats.errorCount++;
+        console.error(`    [C] ✗ ${i + 1}/${users.length} — ERROR for user ${user.id}: ${errMsg}`);
+      }
+
+      buffer.push({
         system: 'C_ZKP',
         sample_size: sampleSize,
         user_id: user.id,
@@ -237,18 +386,25 @@ async function benchmarkSystemC(
         predicate_result: false,
         timestamp: new Date(),
       });
+      stats.count++;
     }
 
-    if ((i + 1) % LOG_INTERVAL === 0) {
-      const last = results[results.length - 1];
-      console.log(`    [C] ${i + 1}/${users.length} — last: ${formatNs(last.latency_ns)}`);
+    // Incremental DB flush
+    if (buffer.length >= DB_FLUSH_SIZE) {
+      await flushBuffer(buffer, 'C');
     }
   }
 
-  return results;
+  // Flush remaining
+  await flushBuffer(buffer, 'C');
+
+  console.log(`    [C] Final: ${stats.provedCount} proofs generated, ${stats.timedOutCount} timeouts, ${stats.errorCount} errors`);
+
+  return stats;
 }
 
-// JIT Warmup — stabilize V8 optimizations before measurement
+// ── JIT Warmup ───────────────────────────────────────────────────────────────
+
 async function warmup(enableZkp: boolean): Promise<void> {
   console.log(`[Warmup] Running ${WARMUP_ITERATIONS} throwaway iterations to stabilize JIT...`);
   const gen = new Generator(99999);
@@ -282,8 +438,16 @@ async function warmup(enableZkp: boolean): Promise<void> {
         u => u.age >= PREDICATE.ageThreshold && u.location === PREDICATE.targetLocation
       );
       for (const user of qualifying.slice(0, 3)) {
-        const proof = await sellerC.generateProof(user, artifacts, PREDICATE);
-        await buyerC.verify(proof, artifacts.vkeyJson);
+        const proof = await withTimeout(
+          sellerC.generateProof(user, artifacts, PREDICATE),
+          ZK_PROOF_TIMEOUT_MS,
+          `warmup proof for user ${user.id}`
+        );
+        await withTimeout(
+          buyerC.verify(proof, artifacts.vkeyJson),
+          ZK_PROOF_TIMEOUT_MS,
+          `warmup verify for user ${user.id}`
+        );
       }
       console.log('  [Warmup] System C done');
     } catch (err) {
@@ -294,7 +458,8 @@ async function warmup(enableZkp: boolean): Promise<void> {
   console.log('[Warmup] Complete.\n');
 }
 
-// Main
+// ── Main ─────────────────────────────────────────────────────────────────────
+
 async function main(): Promise<void> {
   const { sampleSizes, enableZkp } = parseArgs();
 
@@ -304,7 +469,9 @@ async function main(): Promise<void> {
   console.log(`║ Sample sizes: ${sampleSizes.join(', ').padEnd(38)}║`);
   console.log(`║ Predicate:    age >= ${PREDICATE.ageThreshold} AND location === '${PREDICATE.targetLocation}'${' '.repeat(10)}║`);
   console.log(`║ ZK enabled:   ${String(enableZkp).padEnd(38)}║`);
+  console.log(`║ ZK timeout:   ${(ZK_PROOF_TIMEOUT_MS / 1000) + 's'.padEnd(37)}║`);
   console.log(`║ Seed:         ${String(SEED).padEnd(38)}║`);
+  console.log(`║ DB flush:     every ${String(DB_FLUSH_SIZE) + ' results'.padEnd(32)}║`);
   console.log('╚══════════════════════════════════════════════════════╝');
   console.log('');
 
@@ -332,27 +499,23 @@ async function main(): Promise<void> {
     );
 
     // System A
-    const resultsA = await benchmarkSystemA(users, size);
-    console.log(`  [A] Complete: ${resultsA.length} results`);
-    await logResults(resultsA);
+    const statsA = await benchmarkSystemA(users, size);
+    console.log(`  [A] Complete: ${statsA.count} results`);
 
     // System B
-    const resultsB = await benchmarkSystemB(users, size);
-    console.log(`  [B] Complete: ${resultsB.length} results`);
-    await logResults(resultsB);
+    const statsB = await benchmarkSystemB(users, size);
+    console.log(`  [B] Complete: ${statsB.count} results`);
 
     // System C
+    let statsC = emptyStats('C');
     if (enableZkp) {
-      const resultsC = await benchmarkSystemC(users, size);
-      console.log(`  [C] Complete: ${resultsC.length} results`);
-      if (resultsC.length > 0) {
-        await logResults(resultsC);
-      }
+      statsC = await benchmarkSystemC(users, size);
+      console.log(`  [C] Complete: ${statsC.count} results (${statsC.provedCount} proofs, ${statsC.timedOutCount} timeouts)`);
     } else {
       console.log('  [C] ZK disabled, skipping.');
     }
 
-    printSummary(size, resultsA, resultsB, enableZkp ? [] : []);
+    printSummary(size, statsA, statsB, statsC);
   }
 
   console.log(`\n[Export] Writing results to ${CSV_OUTPUT}...`);
@@ -362,33 +525,33 @@ async function main(): Promise<void> {
   console.log('\n[Done] Benchmark complete.');
 }
 
-// Summary printer
+// ── Summary Printer ──────────────────────────────────────────────────────────
+
 function printSummary(
   size: number,
-  resultsA: BenchmarkResult[],
-  resultsB: BenchmarkResult[],
-  resultsC: BenchmarkResult[]
+  statsA: RunningStats,
+  statsB: RunningStats,
+  statsC: RunningStats
 ): void {
-  const avg = (arr: BenchmarkResult[], field: 'latency_ns' | 'cpu_time_ms' | 'payload_bytes') => {
-    const valid = arr.filter(r => r.latency_ns > 0n);
-    if (valid.length === 0) return 'N/A';
-    if (field === 'latency_ns') {
-      const sum = valid.reduce((s, r) => s + r.latency_ns, 0n);
-      return formatNs(sum / BigInt(valid.length));
-    }
-    const sum = valid.reduce((s, r) => s + (r[field] as number), 0);
-    return (sum / valid.length).toFixed(2);
-  };
+  const avgLat = (s: RunningStats) =>
+    s.validCount > 0 ? formatNs(s.totalLatencyNs / BigInt(s.validCount)) : 'N/A';
+  const avgCpu = (s: RunningStats) =>
+    s.validCount > 0 ? (s.totalCpuMs / s.validCount).toFixed(2) : 'N/A';
+  const avgPayload = (s: RunningStats) =>
+    s.validCount > 0 ? (s.totalPayloadBytes / s.validCount).toFixed(2) : 'N/A';
 
   console.log(`\n  ┌─────────────────────────────────────────────────┐`);
   console.log(`  │ Summary for N=${size}`);
   console.log(`  ├──────────┬────────────┬──────────┬──────────────┤`);
   console.log(`  │ System   │ Avg Lat    │ Avg CPU  │ Avg Payload  │`);
   console.log(`  ├──────────┼────────────┼──────────┼──────────────┤`);
-  console.log(`  │ A (Raw)  │ ${avg(resultsA, 'latency_ns').padEnd(10)} │ ${avg(resultsA, 'cpu_time_ms').padEnd(8)}ms│ ${avg(resultsA, 'payload_bytes').padEnd(10)} B │`);
-  console.log(`  │ B (Pred) │ ${avg(resultsB, 'latency_ns').padEnd(10)} │ ${avg(resultsB, 'cpu_time_ms').padEnd(8)}ms│ ${avg(resultsB, 'payload_bytes').padEnd(10)} B │`);
-  if (resultsC.length > 0) {
-    console.log(`  │ C (ZK)   │ ${avg(resultsC, 'latency_ns').padEnd(10)} │ ${avg(resultsC, 'cpu_time_ms').padEnd(8)}ms│ ${avg(resultsC, 'payload_bytes').padEnd(10)} B │`);
+  console.log(`  │ A (Raw)  │ ${avgLat(statsA).padEnd(10)} │ ${avgCpu(statsA).padEnd(8)}ms│ ${avgPayload(statsA).padEnd(10)} B │`);
+  console.log(`  │ B (Pred) │ ${avgLat(statsB).padEnd(10)} │ ${avgCpu(statsB).padEnd(8)}ms│ ${avgPayload(statsB).padEnd(10)} B │`);
+  if (statsC.validCount > 0) {
+    console.log(`  │ C (ZK)   │ ${avgLat(statsC).padEnd(10)} │ ${avgCpu(statsC).padEnd(8)}ms│ ${avgPayload(statsC).padEnd(10)} B │`);
+    if (statsC.timedOutCount > 0) {
+      console.log(`  │          │ ⚠ ${statsC.timedOutCount} proofs timed out${' '.repeat(19)}│`);
+    }
   }
   console.log(`  └──────────┴────────────┴──────────┴──────────────┘`);
 }
